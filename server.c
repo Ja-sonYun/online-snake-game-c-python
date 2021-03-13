@@ -61,6 +61,7 @@
 */
 
 #include <stdio.h>
+#include <unistd.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -122,6 +123,7 @@ struct user
 	struct sockaddr_in addr;
 	int sock;
 	int node_length;
+	uint8_t last_cmd;
 	struct coor_node *head;
 	struct coor_node *last;
 };
@@ -156,9 +158,9 @@ struct coor_node* create_snake(struct user* user_p, uint8_t dir)
 		n = temp;
 	}
 	user_p->last = n;
+	user_p->last_cmd = dir;
 	return temp;
 }
-// n-p n-pXn-p
 
 void move_snake(struct user *user_p, uint8_t dir, bool do_inc)
 {
@@ -180,6 +182,14 @@ void move_snake(struct user *user_p, uint8_t dir, bool do_inc)
 	user_p->last = user_p->last->next;
 	user_p->head->next = NULL;
 
+	if ((user_p->last_cmd == DOWN && dir == UP) ||
+		(user_p->last_cmd == UP && dir == DOWN) ||
+		(user_p->last_cmd == RIGHT && dir == LEFT) ||
+		(user_p->last_cmd == LEFT && dir == RIGHT))
+	{
+		dir = user_p->last_cmd;
+	}
+
 	switch (dir)
 	{
 		case UP:
@@ -199,6 +209,8 @@ void move_snake(struct user *user_p, uint8_t dir, bool do_inc)
 			user_p->head->x = user_p->head->prev->x - 1;
 			break;
 	}
+
+	user_p->last_cmd = dir;
 }
 
 pthread_mutex_t mutex;
@@ -207,6 +219,9 @@ uint32_t seq = 0;
 struct user users[MAX_CLIENT] = { 0, };
 int users_c = 0;
 uint8_t world[MAP_Y_SIZE][MAP_X_SIZE] = { 0, };
+int active_users = 0;
+int synced_clnt = 0;
+bool sending_map = false;
 
 void *handler(void *arg);
 
@@ -239,6 +254,8 @@ int main(int argc, char *argv[])
 
 	printf("[*] running...\n");
 
+
+
 	for (;;)
 	{
 		clnt_addr_ln = sizeof(clnt_addr);
@@ -264,23 +281,24 @@ void *handler(void *arg)
 	struct user* user_p = *((struct user**)arg);
 	struct user_req req;
 	char buf[BUF_SIZE] = { 0, };
+	int str_len = 0;
 
 	printf("handler\n");
 
-	/* for (;;) */
-	/* { */
-	/*     read(user_p->sock, buf, BUF_SIZE); */
-	/*     req = unpack_req(buf); */
-	/*     if (req.input == HOLD) */
-	/*     { */
-	/*         printf("connected. \n"); */
-	/*     } */
-	/*     else if (req.input == START) */
-	/*     { */
-	/*         printf("started. \n"); */
-	/*         break; */
-	/*     } */
-	/* } */
+	for (;;)
+	{
+		read(user_p->sock, buf, BUF_SIZE);
+		req = unpack_req(buf);
+		if (req.input == HOLD)
+		{
+			printf("connected. \n");
+		}
+		else if (req.input == START)
+		{
+			printf("started. \n");
+			break;
+		}
+	}
 
 	struct coor_node* snake_head = (struct coor_node*)calloc(1, sizeof(struct coor_node));
 	user_p->head = snake_head;
@@ -288,18 +306,37 @@ void *handler(void *arg)
 	snake_head->y = 100;
 	create_snake(user_p, RIGHT);
 
-	move_snake(user_p, RIGHT, false);
+	while ((str_len = read(user_p->sock, buf, BUF_SIZE)) != 0)
+	{
+		req = unpack_req(buf);
 
-	printf("x:%d , y:%d\n", user_p->head->x, user_p->head->y);
-	printf("x:%d , y:%d\n", user_p->head->prev->x, user_p->head->prev->y);
-	printf("x:%d , y:%d\n", user_p->head->prev->prev->x, user_p->head->prev->prev->y);
-	/* printf("x:%d , y:%d\n", user_p->head->prev->prev->prev->x, user_p->head->prev->prev->prev->y); */
-	/* for (int i = 0; i < user_p->node_length; i++) */
-	/* { */
-	/*     printf("x:%d , y:%d\n", snake_head->x, snake_head->y); */
-	/*     if (snake_head->prev != NULL) */
-	/*         snake_head = snake_head->prev; */
-	/* } */
+		pthread_mutex_lock(&mutex);
+		if (sending_map)
+		{
+			// send map to clnt
+			synced_clnt++;
+		}
+		pthread_mutex_unlock(&mutex);
+	}
 
 	return NULL;
+}
+
+void *time_handler(void *arg)
+{
+	for (;;)
+	{
+		pthread_mutex_lock(&mutex);
+		if (sending_map && synced_clnt == active_users)
+		{
+			synced_clnt = 0;
+			sending_map = false;
+		}
+		usleep(500);
+		pthread_mutex_unlock(&mutex);
+
+		pthread_mutex_lock(&mutex);
+		sending_map = true;
+		pthread_mutex_unlock(&mutex);
+	}
 }
