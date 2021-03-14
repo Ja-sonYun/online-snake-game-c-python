@@ -83,7 +83,8 @@
 #define RIGHT 0x33
 #define LEFT  0x34
 #define INIT_SNAKE_L 3
-#define MAX_CLIENT 10
+#define MAX_CLNT_BUF 100
+#define MAX_ACTIVE_CLNT 2
 #define RAISE_ERR(str) { printf("[ERR] "str); exit(1); }
 #define MAP_X_SIZE 1000
 #define MAP_Y_SIZE 1000
@@ -188,7 +189,7 @@ pthread_mutex_t m_mutex =            PTHREAD_MUTEX_INITIALIZER;
 pthread_t thread_id;
 uint32_t seq = 0;
 
-struct user users[MAX_CLIENT] = { 0, };
+struct user users[MAX_CLNT_BUF] = { 0, };
 int users_c = 0;
 uint8_t world[MAP_Y_SIZE][MAP_X_SIZE] = { 0, };
 int active_users = 0;
@@ -224,6 +225,7 @@ int main(int argc, char *argv[])
 
 	printf("[*] running...\n");
 
+	pthread_mutex_init(&m_mutex, NULL);
 	pthread_create(&thread_id, NULL, world_handler, NULL);
 
 	for (;;)
@@ -232,6 +234,13 @@ int main(int argc, char *argv[])
 		clnt_sock = accept(serv_sock, (struct sockaddr*)&clnt_addr, &clnt_addr_ln);
 
 		pthread_mutex_lock(&m_mutex);
+		if (active_users == MAX_ACTIVE_CLNT)
+		{
+			printf(KMAG"[WARNING] reached max client %d\n"KWHT, MAX_ACTIVE_CLNT);
+			pthread_mutex_unlock(&m_mutex);
+			// TODO: function that send error message to clinet;
+			continue;
+		}
 		pthread_cond_signal(&main_loop_cond);
 		struct user* user_p = &users[users_c];
 		active_users++;
@@ -303,10 +312,10 @@ void *clnt_map_comm_handler(void *arg)
 
 	for (;;)
 	{
+		pthread_mutex_lock(&m_mutex);
 		pthread_cond_wait(&send_map_cond, &m_mutex);
 // do highlight this user snake
 		write(user_p->sock, buf, BUF_SIZE);
-		pthread_mutex_lock(&m_mutex);
 		send_map = false;
 		pthread_mutex_unlock(&m_mutex);
 	}
@@ -356,6 +365,8 @@ void *clnt_handler(void *arg)
 
 			user_p->pending_cmd = req.input;
 		}
+
+		memset(buf, 0, BUF_SIZE);
 	}
 
 	pthread_mutex_lock(&m_mutex);
@@ -374,9 +385,7 @@ void *clnts_handler(void *arg)
 	{
 		pthread_mutex_lock(&m_mutex);
 		if (!block_all_clnt)
-		{
 			pthread_cond_broadcast(&clnts_loop_cond);
-		}
 		pthread_mutex_unlock(&m_mutex);
 	}
 }
