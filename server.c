@@ -60,6 +60,14 @@
     |                     |
 */
 
+// threads
+// main_thread -> world_handler_thread: calculate all snakes pos
+//         | |
+//         | '--> clnts_handler_thread: block all clnt thread when calculating map
+//         |
+//         '----> (many)clnt_handler_thread:
+//	              '--> clnt_map_comm_handler_thread: send map every 0.5 sec after calculate
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -111,7 +119,7 @@ union {
 	uint16_t uint;
 } __char_int16_t;
 
-static inline ctoui16(char hex0, char hex1)
+__attribute__ ((noinline)) uint16_t ctoui16(char hex0, char hex1)
 {
 	union char_int16_t;
 	__char_int16_t.hex[0] = hex0;
@@ -124,7 +132,7 @@ union {
 	uint32_t uint;
 } __char_int32_t;
 
-static inline ctoui32(char hex0, char hex1, char hex2, char hex3)
+__attribute__ ((noinline)) uint32_t ctoui32(char hex0, char hex1, char hex2, char hex3)
 {
 	union char_int32_t;
 	__char_int32_t.hex[0] = hex0;
@@ -151,11 +159,13 @@ struct coor_node
 
 struct user
 {
+	bool is_active;
 	int id;
 	char *name;
 	struct in_addr addr;
 	int sock;
 	int node_length;
+	uint8_t pending_cmd;
 	uint8_t last_cmd;
 	struct coor_node *head;
 	struct coor_node *last;
@@ -166,10 +176,14 @@ struct user
 
 struct coor_node* create_snake(struct user* user_p, uint8_t dir);
 void move_snake(struct user *user_p, uint8_t dir, bool do_inc);
-void *handler(void *arg);
-void *time_handler(void *arg);
+void *clnt_handler(void *arg);
+void *clnts_handler(void *arg);
+void *world_handler(void *arg);
+bool find_empty_area(struct user *user_);
 
 pthread_cond_t main_loop_cond =	     PTHREAD_COND_INITIALIZER;
+pthread_cond_t clnts_loop_cond =     PTHREAD_COND_INITIALIZER;
+pthread_cond_t send_map_cond =       PTHREAD_COND_INITIALIZER;
 pthread_mutex_t m_mutex =            PTHREAD_MUTEX_INITIALIZER;
 pthread_t thread_id;
 uint32_t seq = 0;
@@ -178,9 +192,8 @@ struct user users[MAX_CLIENT] = { 0, };
 int users_c = 0;
 uint8_t world[MAP_Y_SIZE][MAP_X_SIZE] = { 0, };
 int active_users = 0;
-int synced_clnt = 0;
-bool sending_map = false;
-
+bool send_map = false;
+bool block_all_clnt = false;
 
 int main(int argc, char *argv[])
 {
@@ -211,7 +224,7 @@ int main(int argc, char *argv[])
 
 	printf("[*] running...\n");
 
-	pthread_create(&thread_id, NULL, time_handler, NULL);
+	pthread_create(&thread_id, NULL, world_handler, NULL);
 
 	for (;;)
 	{
@@ -229,10 +242,11 @@ int main(int argc, char *argv[])
 
 		printf(KGRN"[+] user_id %d, ip %s is connected.\n"KWHT, users_c, inet_ntoa(user_p->addr));
 		user_p->sock = clnt_sock;
+		user_p->is_active = true;
 		pthread_mutex_init(&user_p->mutex, NULL);
 		pthread_cond_init(&user_p->cond, NULL);
 
-		pthread_create(&user_p->thread_id, NULL, handler, (void*)&user_p);
+		pthread_create(&user_p->thread_id, NULL, clnt_handler, (void*)&user_p);
 		pthread_detach(user_p->thread_id);
 	}
 	close(serv_sock);
@@ -247,64 +261,137 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
-void *handler(void *arg)
+// need to lock mutex
+bool find_empty_area(struct user *user_)
+{
+	bool not_empty = false;
+	for (int y = 10; y < MAP_Y_SIZE / 10 - 10; y+=2)
+	{
+		for (int x = 10; x < MAP_X_SIZE / 10 - 10; x+=2)
+		{
+			///
+			for (int yz = 0; yz < 10; yz++)
+			{
+				for (int yx = 0; yx < 10; yx++)
+				{
+					if (world[y*10+yz][x*10+yx] == 1)
+					{
+						not_empty = true;
+						break;
+					}
+				}
+				if (not_empty)
+					break;
+			}
+			if (!not_empty)
+			{
+				user_->head->x = x * 10 + 5;
+				user_->head->y = y * 10 + 5;
+				return true;
+			}
+			not_empty = false;
+		}
+	}
+
+	return false;
+}
+
+void *clnt_map_comm_handler(void *arg)
+{
+	struct user* user_p = *((struct user**)arg);
+	char buf[BUF_SIZE] = { 0, };
+
+	for (;;)
+	{
+		pthread_cond_wait(&send_map_cond, &m_mutex);
+// do highlight this user snake
+		write(user_p->sock, buf, BUF_SIZE);
+		pthread_mutex_lock(&m_mutex);
+		send_map = false;
+		pthread_mutex_unlock(&m_mutex);
+	}
+}
+
+void *clnt_handler(void *arg)
 {
 	struct user* user_p = *((struct user**)arg);
 	struct user_req req;
 	char buf[BUF_SIZE] = { 0, };
 	int str_len = 0;
+	bool init = false;
+	pthread_t map_comm_id;
 
-	printf("[*] Enter handler, thread id:%d\n", user_p->id);
+	printf("[*] Enter clnt_handler, thread id:%d\n", user_p->id);
 
-	/* while ((str_len = read(user_p->sock, buf, BUF_SIZE)) != 0) */
-	/* { */
-	/*     printf("got req\n"); */
-	/*     req = UNPACKING(buf); */
-	/*     if (req.input == HOLD) */
-	/*     { */
-	/*         printf("connected. \n"); */
-	/*     } */
-	/*     else if (req.input == START) */
-	/*     { */
-	/*         printf("started. \n"); */
-	/*         break; */
-	/*     } */
-	/* } */
-
-	/* struct coor_node* snake_head = (struct coor_node*)calloc(1, sizeof(struct coor_node)); */
-	/* user_p->head = snake_head; */
-	/* snake_head->x = 100; */
-	/* snake_head->y = 100; */
-	/* create_snake(user_p, RIGHT); */
+	pthread_create(&map_comm_id, NULL, clnt_map_comm_handler, (void*)&user_p);
 
 	while ((str_len = read(user_p->sock, buf, BUF_SIZE)) != 0)
 	{
-		req = UNPACKING(buf);
-
 		pthread_mutex_lock(&m_mutex);
-		if (sending_map)
-		{
-			// send map to clnt
-			synced_clnt++;
-		}
+		pthread_cond_wait(&clnts_loop_cond, &m_mutex); // block this thread when calculating map
 		pthread_mutex_unlock(&m_mutex);
+		if (!init)
+		{
+			req = UNPACKING(buf);
+			if (req.input == HOLD)
+			{
+				printf("connected. \n");
+			}
+			else if (req.input == START)
+			{
+				printf("started. \n");
+
+				struct coor_node* snake_head = (struct coor_node*)calloc(1, sizeof(struct coor_node));
+				user_p->head = snake_head;
+				pthread_mutex_lock(&m_mutex);
+				find_empty_area(user_p);
+				pthread_mutex_unlock(&m_mutex);
+				create_snake(user_p, RIGHT);
+				init = true;
+			}
+		}
+		else
+		{
+			req = UNPACKING(buf);
+
+			user_p->pending_cmd = req.input;
+		}
 	}
 
 	pthread_mutex_lock(&m_mutex);
 	active_users--;
 	pthread_mutex_unlock(&m_mutex);
+	user_p->is_active = false;
 	printf(KYEL"[-] client disconnected.(user id %d, ip %s)\n"KWHT, user_p->id, inet_ntoa(user_p->addr));
 
+	pthread_join(map_comm_id, NULL);
 	return NULL;
 }
 
-void *time_handler(void *arg)
+void *clnts_handler(void *arg)
+{
+	for (;;)
+	{
+		pthread_mutex_lock(&m_mutex);
+		if (!block_all_clnt)
+		{
+			pthread_cond_broadcast(&clnts_loop_cond);
+		}
+		pthread_mutex_unlock(&m_mutex);
+	}
+}
+
+void *world_handler(void *arg)
 {
 	printf("[*] waiting user...\n");
 
 	pthread_mutex_lock(&m_mutex);
 	pthread_cond_wait(&main_loop_cond, &m_mutex);
 	pthread_mutex_unlock(&m_mutex);
+
+	pthread_t clnts_handler_id;
+
+	pthread_create(&clnts_handler_id, NULL, clnts_handler, NULL);
 
 	for (;;)
 	{
@@ -317,18 +404,16 @@ void *time_handler(void *arg)
 		}
 
 		printf("[-] map parsed, seq:%d, active user: %d\n", seq, active_users);
-		if (sending_map && synced_clnt == active_users)
-		{
-			synced_clnt = 0;
-			sending_map = false;
-		}
+		send_map = true;
 		pthread_mutex_unlock(&m_mutex);
 
 		usleep(ONE_SEC * 0.5);
-		/* sending_map = true; */
-		/* pthread_mutex_unlock(&m_mutex); */
 		seq++;
 	}
+
+	pthread_join(clnts_handler_id, NULL);
+
+	return NULL;
 }
 
 // return last
