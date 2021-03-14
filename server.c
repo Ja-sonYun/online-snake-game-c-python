@@ -241,15 +241,14 @@ int main(int argc, char *argv[])
 			// TODO: function that send error message to clinet;
 			continue;
 		}
-		pthread_cond_signal(&main_loop_cond);
 		struct user* user_p = &users[users_c];
 		active_users++;
 		user_p->id = users_c;
 		user_p->addr = clnt_addr.sin_addr;
+		printf(KGRN"[+] user_id %d, ip %s is connected.\n"KWHT, users_c, inet_ntoa(user_p->addr));
 		users_c++;
 		pthread_mutex_unlock(&m_mutex);
 
-		printf(KGRN"[+] user_id %d, ip %s is connected.\n"KWHT, users_c, inet_ntoa(user_p->addr));
 		user_p->sock = clnt_sock;
 		user_p->is_active = true;
 		pthread_mutex_init(&user_p->mutex, NULL);
@@ -333,6 +332,11 @@ void *clnt_handler(void *arg)
 	printf("[*] Enter clnt_handler, thread id:%d\n", user_p->id);
 
 	pthread_create(&map_comm_id, NULL, clnt_map_comm_handler, (void*)&user_p);
+
+	pthread_mutex_lock(&m_mutex);
+	if (active_users == 1)
+		pthread_cond_signal(&main_loop_cond);
+	pthread_mutex_unlock(&m_mutex);
 
 	while ((str_len = read(user_p->sock, buf, BUF_SIZE)) != 0)
 	{
