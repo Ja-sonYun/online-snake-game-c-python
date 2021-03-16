@@ -78,10 +78,13 @@
 #include <netinet/in.h>
 #include <pthread.h>
 
-#define UP    0x31
-#define DOWN  0x32
-#define RIGHT 0x33
-#define LEFT  0x34
+#define MOVECMD_F 0b10000000
+#define WRAP_MVCMD_F(CMD) (MOVECMD_F | CMD)
+#define IS_MVCMD(CMD)     (CMD & MOVECMD_F)
+#define UP    WRAP_MVCMD_F(0x31)
+#define DOWN  WRAP_MVCMD_F(0x32)
+#define RIGHT WRAP_MVCMD_F(0x33)
+#define LEFT  WRAP_MVCMD_F(0x34)
 #define INIT_SNAKE_L 3
 #define MAX_CLNT_BUF 100
 #define MAX_ACTIVE_CLNT 2
@@ -160,7 +163,7 @@ struct coor_node
 
 struct user
 {
-	bool is_active;
+	uint8_t running_thread;
 	bool online;
 	int id;
 	char *name;
@@ -171,8 +174,8 @@ struct user
 	uint8_t last_cmd;
 	struct coor_node *head;
 	struct coor_node *last;
-	pthread_mutex_t mutex;
 	pthread_cond_t cond;
+	pthread_cond_t cal_cond;
 	pthread_t thread_id;
 };
 
@@ -182,10 +185,12 @@ void *clnt_handler(void *arg);
 void *clnts_handler(void *arg);
 void *world_handler(void *arg);
 bool find_empty_area(struct user *user_);
+bool game_key_input(struct user_req req, struct user *user_);
 
 pthread_cond_t main_loop_cond =	   PTHREAD_COND_INITIALIZER;
 pthread_cond_t clnts_loop_cond =   PTHREAD_COND_INITIALIZER;
 pthread_cond_t send_map_cond =	   PTHREAD_COND_INITIALIZER;
+pthread_cond_t comm_ready_cond =   PTHREAD_COND_INITIALIZER;
 pthread_mutex_t m_mutex =          PTHREAD_MUTEX_INITIALIZER;
 pthread_t thread_id;
 uint32_t seq = 0;
@@ -259,8 +264,9 @@ int main(int argc, char *argv[])
 		pthread_mutex_unlock(&m_mutex);
 
 		user_p->sock = clnt_sock;
-		pthread_mutex_init(&user_p->mutex, NULL);
+		user_p->running_thread = 0;
 		pthread_cond_init(&user_p->cond, NULL);
+		pthread_cond_init(&user_p->cal_cond, NULL);
 
 		pthread_create(&user_p->thread_id, NULL, clnt_handler, (void*)&user_p);
 		pthread_detach(user_p->thread_id);
@@ -277,27 +283,113 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
+void clnt_threads_handler_cleanup(void *arg)
+{
+	struct user* user_p = *((struct user**)arg);
+	pthread_mutex_lock(&m_mutex);
+	user_p->running_thread--; // should be 0 at this point
+	pthread_cond_signal(&user_p->cond);
+	pthread_mutex_unlock(&m_mutex);
+	for (;;)
+	{
+		pthread_mutex_lock(&m_mutex);
+		if (user_p->running_thread == 0)
+		{
+			pthread_mutex_unlock(&m_mutex);
+			break;
+		}
+		else
+		{
+			printf(KRED" └ waiting id %d exit..."KWHT"\n", user_p->id);
+			pthread_cond_wait(&user_p->cond, &m_mutex);
+		}
+		pthread_mutex_unlock(&m_mutex);
+	}
+	printf(" └ user id %d successfully cleaned up\n", user_p->id);
+}
+
 void *clnt_map_comm_handler(void *arg)
 {
 	struct user* user_p = *((struct user**)arg);
 	char buf[BUF_SIZE] = { 0, };
-	printf(KMAG"[DEBUG|user_id:%d] Enter clnt_map_comm_handler()\n"KWHT, user_p->id);
+	pthread_cleanup_push(clnt_threads_handler_cleanup, (void*)&user_p);
+	pthread_mutex_lock(&m_mutex);
+	printf(KMAG"[DEBUG|user_id:%d] Enter clnt_map_comm_handler()"KWHT"\n", user_p->id);
+	user_p->running_thread++;
+	pthread_mutex_unlock(&m_mutex);
 
 	for (;;)
 	{
 		pthread_mutex_lock(&m_mutex);
-		if (!user_p->online)
+		if (!user_p->online && user_p->running_thread != 3)
 		{
-			printf("user offline\n");
 			pthread_mutex_unlock(&m_mutex);
+			printf(" └ quitting clnt_map_comm_handler from user id :%d\n", user_p->id);
+			pthread_exit(0);
+			return NULL;
+		}
+#ifdef DEBUG
+		printf(KMAG"[DEBUG|user_id:%d] send map, clnt_map_comm_handler(), seq:%d\n"KWHT, user_p->id, seq);
+#endif
+		pthread_cond_wait(&send_map_cond, &m_mutex);
+		pthread_cond_signal(&user_p->cal_cond);
+		if (user_p->online)
+		{
+			pthread_cond_wait(&user_p->cal_cond, &m_mutex);
+			printf(KMAG"  \\ write at this point, user %d, status:%d, about seq: %d\n"KWHT, user_p->id, user_p->online, seq);
+			// do highlight this user snake
+			/* write(user_p->sock, buf, BUF_SIZE); */
+		}
+		else
+		{
+			pthread_mutex_unlock(&m_mutex);
+			printf(" └ quitting clnt_map_comm_handler from user id :%d\n", user_p->id);
 			pthread_exit(0);
 		}
-		pthread_cond_wait(&send_map_cond, &m_mutex);
-		// do highlight this user snake
-		/* write(user_p->sock, buf, BUF_SIZE); */
-		printf(KMAG"[DEBUG|user_id:%d] send map, clnt_map_comm_handler(), seq:%d\n"KWHT, user_p->id, seq);
 		pthread_mutex_unlock(&m_mutex);
 	}
+
+	pthread_cleanup_pop(0);
+	return NULL;
+}
+
+void *clnt_calc_handler(void *arg)
+{
+	struct user* user_p = *((struct user**)arg);
+	pthread_cleanup_push(clnt_threads_handler_cleanup, (void*)&user_p);
+	pthread_mutex_lock(&m_mutex);
+	user_p->running_thread++;
+	pthread_cond_signal(&main_loop_cond);
+	pthread_mutex_unlock(&m_mutex);
+
+	for (;;)
+	{
+		if (!user_p->online && user_p->running_thread != 3)
+		{
+			pthread_mutex_unlock(&m_mutex);
+			printf(" └ quitting clnt_calc_handler from user id :%d\n", user_p->id);
+			pthread_exit(0);
+			return NULL;
+		}
+		pthread_mutex_lock(&m_mutex);
+		pthread_cond_wait(&user_p->cal_cond, &m_mutex);
+		if (user_p->online)
+		{
+			printf(KMAG" \\ calculate here, user_id %d, about seq: %d"KWHT"\n", user_p->id, seq);
+			pthread_cond_signal(&user_p->cal_cond);
+		}
+		else
+		{
+			pthread_mutex_unlock(&m_mutex);
+			printf(" └ quitting clnt_calc_handler from user id :%d\n", user_p->id);
+			pthread_exit(0);
+			return NULL;
+		}
+		pthread_mutex_unlock(&m_mutex);
+	}
+
+	pthread_cleanup_pop(0);
+	return (void*)1;
 }
 
 void *clnt_handler(void *arg)
@@ -308,20 +400,14 @@ void *clnt_handler(void *arg)
 	int str_len = 0;
 	bool init = false;
 	pthread_t map_comm_id;
-
-	pthread_create(&map_comm_id, NULL, clnt_map_comm_handler, (void*)&user_p);
-	pthread_detach(map_comm_id);
+	pthread_t cal_map_id;
 
 	pthread_mutex_lock(&m_mutex);
-	if (active_users == 1)
-		pthread_cond_signal(&main_loop_cond);
+	user_p->running_thread++;
 	pthread_mutex_unlock(&m_mutex);
 
 	while ((str_len = read(user_p->sock, buf, BUF_SIZE)) != 0)
 	{
-		pthread_mutex_lock(&m_mutex);
-		pthread_cond_wait(&clnts_loop_cond, &m_mutex); // block this thread when calculating map
-		pthread_mutex_unlock(&m_mutex);
 		if (!init)
 		{
 			req = UNPACKING(buf);
@@ -332,34 +418,46 @@ void *clnt_handler(void *arg)
 			else if (req.input == START)
 			{
 				printf(KGRN"[>] user started to play, id:%d."KWHT"\n", user_p->id);
+				pthread_create(&map_comm_id, NULL, clnt_map_comm_handler, (void*)&user_p);
+				pthread_create(&cal_map_id, NULL, clnt_calc_handler, (void*)&user_p);
+				pthread_detach(map_comm_id);
+				pthread_detach(cal_map_id);
 
 				struct coor_node* snake_head = (struct coor_node*)calloc(1, sizeof(struct coor_node));
-				user_p->head = snake_head;
 				pthread_mutex_lock(&m_mutex);
+
+				user_p->head = snake_head;
 				find_empty_area(user_p);
-				pthread_mutex_unlock(&m_mutex);
 				create_snake(user_p, RIGHT);
+				pthread_mutex_unlock(&m_mutex);
 				init = true;
 			}
 		}
 		else
 		{
+			pthread_mutex_lock(&m_mutex);
+			pthread_cond_wait(&clnts_loop_cond, &m_mutex); // block this thread when calculating map
+			pthread_mutex_unlock(&m_mutex);
 			req = UNPACKING(buf);
-			printf(KCYN"[<] user_id %d send commend, key code 0x%X"KWHT"\n", user_p->id, req.input);
 
+			printf(KCYN"[<] user_id %d send commend, key code 0x%X"KWHT"\n", user_p->id, req.input);
+			pthread_mutex_lock(&m_mutex);
 			user_p->pending_cmd = req.input;
+			pthread_mutex_unlock(&m_mutex);
 		}
 
 		memset(buf, 0, BUF_SIZE);
 	}
 
-	pthread_mutex_lock(&m_mutex);
-	user_p->online = false;
-	printf(KYEL"[-] client disconnected.(user id %d, ip %s)\n"KWHT, user_p->id, inet_ntoa(user_p->addr));
-	active_users--;
-	pthread_mutex_unlock(&m_mutex);
 
+	pthread_mutex_lock(&m_mutex);
 	pthread_kill(map_comm_id, 0);
+	user_p->online = false;
+	user_p->running_thread--;
+	active_users--;
+	printf(KYEL"[-] client disconnected.(user id %d, ip %s)\n"KWHT, user_p->id, inet_ntoa(user_p->addr));
+	pthread_cond_signal(&user_p->cond);
+	pthread_mutex_unlock(&m_mutex);
 
 	return NULL;
 }
@@ -392,6 +490,7 @@ void *world_handler(void *arg)
 	for (;;)
 	{
 		pthread_mutex_lock(&m_mutex);
+		pthread_cond_broadcast(&send_map_cond);
 		if (!active_users)
 		{
 			printf_clr(KBLU"[*] no user, stop server...");
@@ -399,8 +498,11 @@ void *world_handler(void *arg)
 			pthread_cond_wait(&main_loop_cond, &m_mutex);
 			printf_clr(KBLU"[*] resume server...");
 		}
-		pthread_cond_broadcast(&send_map_cond);
-		printf("[-] map parsed, seq:%d, active user: %d\n", seq, active_users);
+		else
+		{
+			printf("[-] map parsed, seq:%d, active user: %d\n", seq, active_users);
+			// map parse function here
+		}
 		pthread_mutex_unlock(&m_mutex);
 
 		usleep(ONE_SEC * 0.5);
@@ -530,4 +632,18 @@ bool find_empty_area(struct user *user_)
 	}
 
 	return false;
+}
+
+bool game_key_input(struct user_req req, struct user *user_)
+{
+	pthread_mutex_lock(&m_mutex);
+	if (!IS_MVCMD(req.input))
+	{
+		pthread_mutex_unlock(&m_mutex);
+		return false;
+	}
+	// check something is there in front of the head
+	move_snake(user_, req.input, 0);
+
+	pthread_mutex_unlock(&m_mutex);
 }
