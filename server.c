@@ -170,6 +170,7 @@ struct user
 	struct in_addr addr;
 	int sock;
 	int node_length;
+	uint32_t seq;
 	uint8_t pending_cmd;
 	uint8_t last_cmd;
 	struct coor_node *head;
@@ -189,8 +190,9 @@ bool game_key_input(struct user_req req, struct user *user_);
 
 pthread_cond_t main_loop_cond =	   PTHREAD_COND_INITIALIZER;
 pthread_cond_t clnts_loop_cond =   PTHREAD_COND_INITIALIZER;
-pthread_cond_t send_map_cond =	   PTHREAD_COND_INITIALIZER;
-pthread_cond_t comm_ready_cond =   PTHREAD_COND_INITIALIZER;
+pthread_cond_t clnt_ready_cond =   PTHREAD_COND_INITIALIZER;
+pthread_cond_t map_ready_cond =    PTHREAD_COND_INITIALIZER;
+pthread_cond_t send_map_cond =     PTHREAD_COND_INITIALIZER;
 pthread_mutex_t m_mutex =          PTHREAD_MUTEX_INITIALIZER;
 pthread_t thread_id;
 uint32_t seq = 0;
@@ -264,6 +266,7 @@ int main(int argc, char *argv[])
 		pthread_mutex_unlock(&m_mutex);
 
 		user_p->sock = clnt_sock;
+		user_p->seq = 0;
 		user_p->running_thread = 0;
 		pthread_cond_init(&user_p->cond, NULL);
 		pthread_cond_init(&user_p->cal_cond, NULL);
@@ -336,6 +339,8 @@ void *clnt_map_comm_handler(void *arg)
 		if (user_p->online)
 		{
 			pthread_cond_wait(&user_p->cal_cond, &m_mutex);
+			printf_clr(KYEL"  \\ calculated");
+			pthread_cond_wait(&map_ready_cond, &m_mutex);
 			printf(KMAG"  \\ write at this point, user %d, status:%d, about seq: %d\n"KWHT, user_p->id, user_p->online, seq);
 			// do highlight this user snake
 			/* write(user_p->sock, buf, BUF_SIZE); */
@@ -359,7 +364,8 @@ void *clnt_calc_handler(void *arg)
 	pthread_cleanup_push(clnt_threads_handler_cleanup, (void*)&user_p);
 	pthread_mutex_lock(&m_mutex);
 	user_p->running_thread++;
-	pthread_cond_signal(&main_loop_cond);
+	if (active_users > 0)
+		pthread_cond_signal(&main_loop_cond);
 	pthread_mutex_unlock(&m_mutex);
 
 	for (;;)
@@ -478,6 +484,7 @@ void *clnts_handler(void *arg)
 void *world_handler(void *arg)
 {
 	printf("[*] waiting user...\n");
+	int calced_user = 0;
 
 	pthread_mutex_lock(&m_mutex);
 	pthread_cond_wait(&main_loop_cond, &m_mutex);
@@ -489,24 +496,37 @@ void *world_handler(void *arg)
 
 	for (;;)
 	{
-		pthread_mutex_lock(&m_mutex);
-		pthread_cond_broadcast(&send_map_cond);
+		printf_clr(KYEL"[*] wait for all user calculated");
 		if (!active_users)
 		{
+			pthread_mutex_lock(&m_mutex);
 			printf_clr(KBLU"[*] no user, stop server...");
 			printf_clr(KBLU"------------------------------");
 			pthread_cond_wait(&main_loop_cond, &m_mutex);
 			printf_clr(KBLU"[*] resume server...");
+			pthread_mutex_unlock(&m_mutex);
 		}
 		else
 		{
+			seq++;
+			pthread_cond_broadcast(&send_map_cond);
+			for (;;)
+			{
+				pthread_mutex_lock(&m_mutex);
+				calced_user++;
+				if (calced_user == active_users)
+				{
+					calced_user = 0;
+					pthread_cond_broadcast(&map_ready_cond);
+					pthread_mutex_unlock(&m_mutex);
+					break;
+				}
+			}
 			printf("[-] map parsed, seq:%d, active user: %d\n", seq, active_users);
 			// map parse function here
 		}
-		pthread_mutex_unlock(&m_mutex);
 
-		usleep(ONE_SEC * 0.5);
-		seq++;
+		usleep(ONE_SEC);
 	}
 
 	pthread_join(clnts_handler_id, NULL);

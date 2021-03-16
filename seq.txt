@@ -1,0 +1,31 @@
+participant "EP" as ep
+participant "clnts_handler" as cs
+participant "world_handler" as w
+participant "clnt_handler" as c
+participant "clnt_calc_handler" as cc
+participant "clnt_map_comm_handler" as cm
+
+ep->w: pthread_create
+ep->c: pthread_create(many)
+
+w->w: pthd_wait(main_loop_cond)
+c->cm: pthread_create
+c->cc: pthread_create
+cc->w: pthd_signal(main_loop_cond)
+w->cs: pthread_create
+c->c: read loop
+
+cm->cm : pthd_wait(send_map_cond)
+cc->cc: pthd_wait(user->cal_cond)
+w->w: loop, e0.5s
+w->cm: pthd_broadcast(send_map_cond)
+w->w: "wait until
+all client
+calculated"
+cm->cc: pthd_signal(user->cal_cond)
+cm->cm: pthd_wait(user->cal_cond)
+cc->cm: pthd_signal(user->cal_cond)
+cm->cm: pthd_wait(map_ready_cond)
+ep->ep: "calced_user++"
+w->w: "if calced==active"
+w->cm: pthd_broadcast(map_ready_cond)
