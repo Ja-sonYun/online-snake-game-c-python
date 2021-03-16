@@ -1,4 +1,3 @@
-import numpy as np
 import curses
 import socket
 import sys
@@ -31,8 +30,8 @@ class ComServ:
         self.socket = socket.socket()
         self.socket.connect((saddr, int(sport)))
 
-    def send_key(self, mssg):
-        self.socket.send(mssg.encode())
+    def send_bytes(self, mssg):
+        self.socket.send(bytearray(mssg))
 
     def close(self):
         self.socket.close()
@@ -44,6 +43,23 @@ if __name__ == '__main__':
 
     comserv = ComServ(sys.argv[1], sys.argv[2], sys.argv[3])
 
-    comserv.send_key("test")
+    comserv.send_bytes([0x01]) #init
+    sleep(1)
+    comserv.send_bytes([0x02]) #start
+    sleep(0.01)
+    comserv.send_bytes([0x31]) #start
+    sleep(0.01)
+    comserv.send_bytes([0x31]) #start
+    sleep(0.01)
+    comserv.send_bytes([0x31]) #start
+    sleep(0.01)
+    comserv.send_bytes([0x31]) #start
+    sleep(0.01)
+    comserv.send_bytes([0x31]) #start
+    sleep(0.01)
+    comserv.send_bytes([0x31]) #start
+    sleep(5)
+
+
 
     comserv.close()

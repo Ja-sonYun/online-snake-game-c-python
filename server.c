@@ -93,11 +93,11 @@
 #define SNAKE   2
 #define H_SNAKE 5
 #define BUF_SIZE 2000
-#define HOLD  0x01
+#define INIT  0x01
 #define START 0x02
 #define ONE_SEC 1000000
 
-#define printf_clr(str) printf(str KWHT)
+#define printf_clr(str) printf(str KWHT"\n")
 #define KNRM  "\x1B[0m"
 #define KRED  "\x1B[31m"
 #define KGRN  "\x1B[32m"
@@ -161,6 +161,7 @@ struct coor_node
 struct user
 {
 	bool is_active;
+	bool online;
 	int id;
 	char *name;
 	struct in_addr addr;
@@ -182,10 +183,10 @@ void *clnts_handler(void *arg);
 void *world_handler(void *arg);
 bool find_empty_area(struct user *user_);
 
-pthread_cond_t main_loop_cond =	     PTHREAD_COND_INITIALIZER;
-pthread_cond_t clnts_loop_cond =     PTHREAD_COND_INITIALIZER;
-pthread_cond_t send_map_cond =       PTHREAD_COND_INITIALIZER;
-pthread_mutex_t m_mutex =            PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t main_loop_cond =	 PTHREAD_COND_INITIALIZER;
+pthread_cond_t clnts_loop_cond = PTHREAD_COND_INITIALIZER;
+pthread_cond_t send_map_cond =   PTHREAD_COND_INITIALIZER;
+pthread_mutex_t m_mutex =        PTHREAD_MUTEX_INITIALIZER;
 pthread_t thread_id;
 uint32_t seq = 0;
 
@@ -193,7 +194,6 @@ struct user users[MAX_CLNT_BUF] = { 0, };
 int users_c = 0;
 uint8_t world[MAP_Y_SIZE][MAP_X_SIZE] = { 0, };
 int active_users = 0;
-bool send_map = false;
 bool block_all_clnt = false;
 
 int main(int argc, char *argv[])
@@ -201,7 +201,6 @@ int main(int argc, char *argv[])
 	int serv_sock, clnt_sock;
 	struct sockaddr_in serv_addr, clnt_addr;
 	int clnt_addr_ln;
-	int proc_user_id;
 
 	int status_when_exist;
 
@@ -245,12 +244,21 @@ int main(int argc, char *argv[])
 		active_users++;
 		user_p->id = users_c;
 		user_p->addr = clnt_addr.sin_addr;
-		printf(KGRN"[+] user_id %d, ip %s is connected.\n"KWHT, users_c, inet_ntoa(user_p->addr));
+		if (!user_p->online)
+			user_p->online = true;
+		else
+		{
+			printf(KRED"[x] user_id %d, suspicious connection.\n"KWHT, users_c);
+			memset(&user_p[users_c], 0, sizeof(struct user));
+			active_users--;
+			pthread_mutex_unlock(&m_mutex);
+			continue;
+		}
+		printf(KGRN"[+] user_id %d, ip %s, socket_id %d is connected.\n"KWHT, users_c, inet_ntoa(user_p->addr), clnt_sock);
 		users_c++;
 		pthread_mutex_unlock(&m_mutex);
 
 		user_p->sock = clnt_sock;
-		user_p->is_active = true;
 		pthread_mutex_init(&user_p->mutex, NULL);
 		pthread_cond_init(&user_p->cond, NULL);
 
@@ -269,53 +277,24 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
-// need to lock mutex
-bool find_empty_area(struct user *user_)
-{
-	bool not_empty = false;
-	for (int y = 10; y < MAP_Y_SIZE / 10 - 10; y+=2)
-	{
-		for (int x = 10; x < MAP_X_SIZE / 10 - 10; x+=2)
-		{
-			///
-			for (int yz = 0; yz < 10; yz++)
-			{
-				for (int yx = 0; yx < 10; yx++)
-				{
-					if (world[y*10+yz][x*10+yx] == 1)
-					{
-						not_empty = true;
-						break;
-					}
-				}
-				if (not_empty)
-					break;
-			}
-			if (!not_empty)
-			{
-				user_->head->x = x * 10 + 5;
-				user_->head->y = y * 10 + 5;
-				return true;
-			}
-			not_empty = false;
-		}
-	}
-
-	return false;
-}
-
 void *clnt_map_comm_handler(void *arg)
 {
 	struct user* user_p = *((struct user**)arg);
 	char buf[BUF_SIZE] = { 0, };
+	printf(KMAG"[DEBUG|user_id:%d] Enter clnt_map_comm_handler()\n"KWHT, user_p->id);
 
 	for (;;)
 	{
 		pthread_mutex_lock(&m_mutex);
 		pthread_cond_wait(&send_map_cond, &m_mutex);
-// do highlight this user snake
-		write(user_p->sock, buf, BUF_SIZE);
-		send_map = false;
+		if (!user_p->online)
+		{
+			pthread_mutex_unlock(&m_mutex);
+			pthread_exit(0);
+		}
+		// do highlight this user snake
+		/* write(user_p->sock, buf, BUF_SIZE); */
+		printf(KMAG"[DEBUG|user_id:%d] send map, clnt_map_comm_handler(), seq:%d\n"KWHT, user_p->id, seq);
 		pthread_mutex_unlock(&m_mutex);
 	}
 }
@@ -328,8 +307,6 @@ void *clnt_handler(void *arg)
 	int str_len = 0;
 	bool init = false;
 	pthread_t map_comm_id;
-
-	printf("[*] Enter clnt_handler, thread id:%d\n", user_p->id);
 
 	pthread_create(&map_comm_id, NULL, clnt_map_comm_handler, (void*)&user_p);
 
@@ -346,13 +323,13 @@ void *clnt_handler(void *arg)
 		if (!init)
 		{
 			req = UNPACKING(buf);
-			if (req.input == HOLD)
+			if (req.input == INIT)
 			{
-				printf("connected. \n");
+				printf(KGRN"[+] user connected, id:%d."KWHT"\n", user_p->id);
 			}
 			else if (req.input == START)
 			{
-				printf("started. \n");
+				printf(KGRN"[>] user started to play, id:%d."KWHT"\n", user_p->id);
 
 				struct coor_node* snake_head = (struct coor_node*)calloc(1, sizeof(struct coor_node));
 				user_p->head = snake_head;
@@ -366,6 +343,7 @@ void *clnt_handler(void *arg)
 		else
 		{
 			req = UNPACKING(buf);
+			printf(KCYN"[<] user_id %d send commend, key code 0x%X"KWHT"\n", user_p->id, req.input);
 
 			user_p->pending_cmd = req.input;
 		}
@@ -375,11 +353,13 @@ void *clnt_handler(void *arg)
 
 	pthread_mutex_lock(&m_mutex);
 	active_users--;
-	pthread_mutex_unlock(&m_mutex);
-	user_p->is_active = false;
+	user_p->online = false;
 	printf(KYEL"[-] client disconnected.(user id %d, ip %s)\n"KWHT, user_p->id, inet_ntoa(user_p->addr));
+	pthread_mutex_unlock(&m_mutex);
 
+	pthread_kill(map_comm_id, 0);
 	pthread_join(map_comm_id, NULL);
+
 	return NULL;
 }
 
@@ -389,7 +369,9 @@ void *clnts_handler(void *arg)
 	{
 		pthread_mutex_lock(&m_mutex);
 		if (!block_all_clnt)
+		{
 			pthread_cond_broadcast(&clnts_loop_cond);
+		}
 		pthread_mutex_unlock(&m_mutex);
 	}
 }
@@ -411,13 +393,13 @@ void *world_handler(void *arg)
 		pthread_mutex_lock(&m_mutex);
 		if (!active_users)
 		{
-			printf_clr(KBLU"[*] no user, stop server...\n");
+			printf_clr(KBLU"[*] no user, stop server...");
+			printf_clr(KBLU"------------------------------");
 			pthread_cond_wait(&main_loop_cond, &m_mutex);
-			printf_clr(KBLU"[*] resume server...\n");
+			printf_clr(KBLU"[*] resume server...");
 		}
-
+		pthread_cond_broadcast(&send_map_cond);
 		printf("[-] map parsed, seq:%d, active user: %d\n", seq, active_users);
-		send_map = true;
 		pthread_mutex_unlock(&m_mutex);
 
 		usleep(ONE_SEC * 0.5);
@@ -512,4 +494,39 @@ void move_snake(struct user *user_p, uint8_t dir, bool do_inc)
 	}
 
 	user_p->last_cmd = dir;
+}
+
+// need to lock mutex
+bool find_empty_area(struct user *user_)
+{
+	bool not_empty = false;
+	for (int y = 10; y < MAP_Y_SIZE / 10 - 10; y+=2)
+	{
+		for (int x = 10; x < MAP_X_SIZE / 10 - 10; x+=2)
+		{
+			///
+			for (int yz = 0; yz < 10; yz++)
+			{
+				for (int yx = 0; yx < 10; yx++)
+				{
+					if (world[y*10+yz][x*10+yx] == 1)
+					{
+						not_empty = true;
+						break;
+					}
+				}
+				if (not_empty)
+					break;
+			}
+			if (!not_empty)
+			{
+				user_->head->x = x * 10 + 5;
+				user_->head->y = y * 10 + 5;
+				return true;
+			}
+			not_empty = false;
+		}
+	}
+
+	return false;
 }
