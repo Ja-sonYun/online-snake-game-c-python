@@ -183,10 +183,10 @@ void *clnts_handler(void *arg);
 void *world_handler(void *arg);
 bool find_empty_area(struct user *user_);
 
-pthread_cond_t main_loop_cond =	 PTHREAD_COND_INITIALIZER;
-pthread_cond_t clnts_loop_cond = PTHREAD_COND_INITIALIZER;
-pthread_cond_t send_map_cond =   PTHREAD_COND_INITIALIZER;
-pthread_mutex_t m_mutex =        PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t main_loop_cond =	   PTHREAD_COND_INITIALIZER;
+pthread_cond_t clnts_loop_cond =   PTHREAD_COND_INITIALIZER;
+pthread_cond_t send_map_cond =	   PTHREAD_COND_INITIALIZER;
+pthread_mutex_t m_mutex =          PTHREAD_MUTEX_INITIALIZER;
 pthread_t thread_id;
 uint32_t seq = 0;
 
@@ -286,12 +286,13 @@ void *clnt_map_comm_handler(void *arg)
 	for (;;)
 	{
 		pthread_mutex_lock(&m_mutex);
-		pthread_cond_wait(&send_map_cond, &m_mutex);
 		if (!user_p->online)
 		{
+			printf("user offline\n");
 			pthread_mutex_unlock(&m_mutex);
 			pthread_exit(0);
 		}
+		pthread_cond_wait(&send_map_cond, &m_mutex);
 		// do highlight this user snake
 		/* write(user_p->sock, buf, BUF_SIZE); */
 		printf(KMAG"[DEBUG|user_id:%d] send map, clnt_map_comm_handler(), seq:%d\n"KWHT, user_p->id, seq);
@@ -309,6 +310,7 @@ void *clnt_handler(void *arg)
 	pthread_t map_comm_id;
 
 	pthread_create(&map_comm_id, NULL, clnt_map_comm_handler, (void*)&user_p);
+	pthread_detach(map_comm_id);
 
 	pthread_mutex_lock(&m_mutex);
 	if (active_users == 1)
@@ -352,13 +354,12 @@ void *clnt_handler(void *arg)
 	}
 
 	pthread_mutex_lock(&m_mutex);
-	active_users--;
 	user_p->online = false;
 	printf(KYEL"[-] client disconnected.(user id %d, ip %s)\n"KWHT, user_p->id, inet_ntoa(user_p->addr));
+	active_users--;
 	pthread_mutex_unlock(&m_mutex);
 
 	pthread_kill(map_comm_id, 0);
-	pthread_join(map_comm_id, NULL);
 
 	return NULL;
 }
