@@ -99,6 +99,7 @@
 #define INIT  0x01
 #define START 0x02
 #define ONE_SEC 1000000
+#define UPDATE_INTERVAL ONE_SEC*0.7
 
 #define printf_clr(str) printf(str KWHT"\n")
 #define KNRM  "\x1B[0m"
@@ -560,7 +561,7 @@ void *world_handler(void *arg)
 		}
 		pthread_mutex_unlock(&m_mutex);
 
-		usleep(ONE_SEC);//*0.5);
+		usleep(UPDATE_INTERVAL);//*0.5);
 		printf_clr(KGRN"----- seq++ -----");
 	}
 
