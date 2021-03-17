@@ -81,11 +81,11 @@
 #define MOVECMD_F 0b10000000
 #define WRAP_MVCMD_F(CMD) (MOVECMD_F | CMD)
 #define IS_MVCMD(CMD)     (CMD & MOVECMD_F)
-#define UP    WRAP_MVCMD_F(0x31)
-#define DOWN  WRAP_MVCMD_F(0x32)
+#define DOWN  WRAP_MVCMD_F(0x31)
+#define UP    WRAP_MVCMD_F(0x32)
 #define RIGHT WRAP_MVCMD_F(0x33)
 #define LEFT  WRAP_MVCMD_F(0x34)
-#define INIT_SNAKE_L 3
+#define INIT_SNAKE_L 4
 #define MAX_CLNT_BUF 100
 #define MAX_ACTIVE_CLNT 2
 #define RAISE_ERR(str) { printf("[ERR] "str); exit(1); }
@@ -165,6 +165,8 @@ struct user
 {
 	uint8_t running_thread;
 	bool online;
+	bool playing;
+	bool alive;
 	int id;
 	char *name;
 	struct in_addr addr;
@@ -183,13 +185,22 @@ struct user
 	pthread_t thread_id;
 };
 
+typedef struct _p
+{
+	int u;
+	uint8_t t;
+} p_t;
+
 struct coor_node* create_snake(struct user* user_p, uint8_t dir);
 void move_snake(struct user *user_p, uint8_t dir, bool do_inc);
+void parse_all_snakes();
+void snake_one_tick(struct user *user_p);
 void *clnt_handler(void *arg);
 void *clnts_handler(void *arg);
 void *world_handler(void *arg);
 bool find_empty_area(struct user *user_);
 bool game_key_input(struct user_req req, struct user *user_);
+void dump_map(int y, int x, int range); // from(y, x) to(y+range, x+range)
 
 pthread_cond_t main_loop_cond =	   PTHREAD_COND_INITIALIZER;
 pthread_cond_t clnt_quit_cond =    PTHREAD_COND_INITIALIZER;
@@ -203,7 +214,8 @@ uint32_t seq = 0;
 
 struct user users[MAX_CLNT_BUF] = { 0, };
 int users_c = 0;
-uint8_t world[MAP_Y_SIZE][MAP_X_SIZE] = { 0, };
+p_t world[MAP_Y_SIZE][MAP_X_SIZE] = { 0, };
+p_t prev_world[MAP_Y_SIZE][MAP_X_SIZE] = { 0, };
 int active_users = 0;
 int playing_users = 0;
 int calculated_users = 0;
@@ -257,6 +269,7 @@ int main(int argc, char *argv[])
 		active_users++;
 		user_p->id = users_c;
 		user_p->addr = clnt_addr.sin_addr;
+		user_p->playing = false;
 		if (!user_p->online)
 			user_p->online = true;
 		else
@@ -309,7 +322,9 @@ void *clnt_map_comm_handler(void *arg)
 	char buf[BUF_SIZE] = { 0, };
 	pthread_cleanup_push(clnt_threads_handler_cleanup, (void*)&user_p);
 	pthread_mutex_lock(&m_mutex);
+#ifdef DEBUG
 	printf(KMAG"[DEBUG|user_id:%d] Enter clnt_map_comm_handler()"KWHT"\n", user_p->id);
+#endif
 	user_p->running_thread++;
 	pthread_mutex_unlock(&m_mutex);
 	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
@@ -328,9 +343,13 @@ void *clnt_map_comm_handler(void *arg)
 		{
 			pthread_cond_wait(&user_p->cal_cond, &m_mutex); // wait until calcuated
 			calculated_users++;
+#ifdef DEBUG
 			printf_clr(KYEL"  \\ calculated");
+#endif
 			pthread_cond_wait(&map_ready_cond, &m_mutex); // wait until calcuated
+#ifdef DEBUG
 			printf(KMAG"  \\ write at this point, user %d, status:%d, about seq: %d\n"KWHT, user_p->id, user_p->online, seq);
+#endif
 			// do highlight this user snake
 			/* write(user_p->sock, buf, BUF_SIZE); */
 		}
@@ -360,9 +379,11 @@ void *clnt_calc_handler(void *arg)
 		pthread_cond_wait(&user_p->cal_cond, &m_mutex); // wait signal from clnt_map_comm_handler()
 		if (user_p->online)
 		{
+#ifdef DEBUG
 			printf(KMAG" \\ calculate here, user_id %d, about seq: %d"KWHT"\n", user_p->id, seq);
-			/* cal() */
-			pthread_cond_signal(&user_p->cal_cond); // send signal that calculated
+#endif
+			snake_one_tick(user_p);
+			pthread_cond_signal(&user_p->cal_cond); // send signal that this is calculated
 		}
 		pthread_mutex_unlock(&m_mutex);
 		pthread_testcancel();
@@ -404,9 +425,13 @@ void *clnt_handler(void *arg)
 				pthread_mutex_lock(&m_mutex);
 
 				user_p->head = snake_head;
-				playing_users++;
+				user_p->pending_cmd = 0;
 				find_empty_area(user_p);
 				create_snake(user_p, RIGHT);
+				user_p->alive = true;
+
+				playing_users++;
+				user_p->playing = true;
 				pthread_mutex_unlock(&m_mutex);
 				init = true;
 			}
@@ -417,7 +442,9 @@ void *clnt_handler(void *arg)
 			pthread_mutex_unlock(&m_mutex);
 			req = UNPACKING(buf);
 
+#ifdef DEBUG
 			printf(KCYN"[<] user_id %d send commend, key code 0x%X"KWHT"\n", user_p->id, req.input);
+#endif
 			pthread_mutex_lock(&m_mutex);
 			user_p->pending_cmd = req.input;
 			pthread_mutex_unlock(&m_mutex);
@@ -431,6 +458,7 @@ void *clnt_handler(void *arg)
 	playing_users--;
 	printf(KYEL"[-] client disconnected.(user id %d, ip %s)\n"KWHT, user_p->id, inet_ntoa(user_p->addr));
 	user_p->online = false;
+	user_p->playing = false;
 	active_users--;
 	user_p->running_thread--;
 	pthread_mutex_unlock(&m_mutex);
@@ -503,7 +531,9 @@ void *world_handler(void *arg)
 			seq++;
 			pthread_mutex_unlock(&m_mutex);
 			pthread_cond_broadcast(&until_next_tick); // resume all sub processes from clnts
+#ifdef DEBUG
 			printf_clr(KYEL"[*] wait for all user calculated");
+#endif
 			for (;;)
 			{
 				pthread_mutex_lock(&m_mutex);
@@ -516,13 +546,21 @@ void *world_handler(void *arg)
 				pthread_mutex_unlock(&m_mutex);
 			}
 			pthread_mutex_lock(&m_mutex);
+#ifdef DEBUG
 			printf("[-] all calculated. start parsing the map, about seq:%d, playing user: %d\n", seq, playing_users);
+#endif
 			// map parse function here
+			parse_all_snakes();
+#ifdef DEBUG
+			printf("[-] all parsed. start to write, about seq:%d, playing user: %d\n", seq, playing_users);
+#endif
 			pthread_cond_broadcast(&map_ready_cond); // broadcast to all clnts, do write
+
+			dump_map(100, 100, 50);
 		}
 		pthread_mutex_unlock(&m_mutex);
 
-		usleep(ONE_SEC);
+		usleep(ONE_SEC);//*0.5);
 		printf_clr(KGRN"----- seq++ -----");
 	}
 
@@ -629,7 +667,7 @@ bool find_empty_area(struct user *user_)
 			{
 				for (int yx = 0; yx < 10; yx++)
 				{
-					if (world[y*10+yz][x*10+yx] == 1)
+					if (world[y*10+yz][x*10+yx].t == SNAKE)
 					{
 						not_empty = true;
 						break;
@@ -654,13 +692,64 @@ bool find_empty_area(struct user *user_)
 bool game_key_input(struct user_req req, struct user *user_)
 {
 	pthread_mutex_lock(&m_mutex);
-	if (!IS_MVCMD(req.input))
-	{
-		pthread_mutex_unlock(&m_mutex);
-		return false;
-	}
 	// check something is there in front of the head
 	move_snake(user_, req.input, 0);
 
 	pthread_mutex_unlock(&m_mutex);
+}
+
+
+// already locked before call this
+void snake_one_tick(struct user *user_p)
+{
+	if (user_p->pending_cmd == 0 || !IS_MVCMD(user_p->pending_cmd))
+		move_snake(user_p, user_p->last_cmd, 0);
+	else
+	{
+		move_snake(user_p, user_p->pending_cmd, 0);
+		user_p->pending_cmd = 0;
+	}
+}
+
+// mutex locked
+void parse_all_snakes()
+{
+	struct coor_node *t;
+	memcpy(&prev_world, world, sizeof(world));
+	memset(&world, 0, sizeof(world));
+	for (int i = 0; i < users_c; i++)
+	{
+		if (users[i].playing)
+		{
+			/* if (world[users[i].head->y][users[i].head->x].t == SNAKE)// or reached border of world */
+
+			// redraw map
+			t = users[i].head;
+			for (int j = 0; j < users[i].node_length; j++)
+			{
+				world[t->y][t->x].t = SNAKE;
+				world[t->y][t->x].u = users[i].id;
+				/* printf(KCYN"user id %d -> head x: %d, y: %d"KWHT"\n", users[i].id, t->x, t->y); */
+				if (t->prev == NULL)
+					break;
+				t = t->prev;
+			}
+
+		}
+	}
+}
+
+void dump_map(int y, int x, int range)
+{
+	for (int i = y; i < y+range; i++)
+	{
+		for (int j = x; j < x+range; j++)
+		{
+			if (world[i][j].t == SNAKE)
+				putchar('*');
+			else
+				putchar(' ');
+		}
+		putchar('\n');
+	}
 }

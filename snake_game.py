@@ -43,21 +43,34 @@ if __name__ == '__main__':
 
     comserv = ComServ(sys.argv[1], sys.argv[2], sys.argv[3])
 
+    input('init?')
     comserv.send_bytes([0x01]) #init
-    sleep(1)
+    input('start?')
     comserv.send_bytes([0x02]) #start
+
+    while True:
+        a = input("key : ")
+        if a == 'w':
+            comserv.send_bytes([0xB1]) #start
+        elif a == 's':
+            comserv.send_bytes([0xB2]) #start
+        elif a == 'd':
+            comserv.send_bytes([0xB3]) #start
+        elif a == 'a':
+            comserv.send_bytes([0xB4]) #start
+
+
+
     sleep(0.01)
-    comserv.send_bytes([0x31]) #start
+    comserv.send_bytes([0xB3]) #start
     sleep(0.01)
-    comserv.send_bytes([0x31]) #start
+    comserv.send_bytes([0xB3]) #start
     sleep(0.01)
-    comserv.send_bytes([0x31]) #start
-    sleep(0.01)
-    comserv.send_bytes([0x31]) #start
-    sleep(0.01)
-    comserv.send_bytes([0x31]) #start
-    sleep(0.01)
-    comserv.send_bytes([0x31]) #start
+    comserv.send_bytes([0xB3]) #start
+    sleep(5)
+    comserv.send_bytes([0xB3]) #start
+    sleep(2)
+    comserv.send_bytes([0xB2]) #start
     sleep(5)
 
 
