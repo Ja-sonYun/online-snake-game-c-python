@@ -177,6 +177,9 @@ struct user
 	struct coor_node *last;
 	pthread_cond_t cond;
 	pthread_cond_t cal_cond;
+	pthread_mutex_t mutex;
+	pthread_t clnt_calc_handler_id;
+	pthread_t clnt_map_comm_handler_id;
 	pthread_t thread_id;
 };
 
@@ -189,11 +192,12 @@ bool find_empty_area(struct user *user_);
 bool game_key_input(struct user_req req, struct user *user_);
 
 pthread_cond_t main_loop_cond =	   PTHREAD_COND_INITIALIZER;
-pthread_cond_t clnts_loop_cond =   PTHREAD_COND_INITIALIZER;
+pthread_cond_t clnt_quit_cond =    PTHREAD_COND_INITIALIZER;
 pthread_cond_t clnt_ready_cond =   PTHREAD_COND_INITIALIZER;
 pthread_cond_t map_ready_cond =    PTHREAD_COND_INITIALIZER;
-pthread_cond_t send_map_cond =     PTHREAD_COND_INITIALIZER;
+pthread_cond_t until_next_tick =   PTHREAD_COND_INITIALIZER;
 pthread_mutex_t m_mutex =          PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t pseudo_mutex =     PTHREAD_MUTEX_INITIALIZER;
 pthread_t thread_id;
 uint32_t seq = 0;
 
@@ -201,6 +205,8 @@ struct user users[MAX_CLNT_BUF] = { 0, };
 int users_c = 0;
 uint8_t world[MAP_Y_SIZE][MAP_X_SIZE] = { 0, };
 int active_users = 0;
+int playing_users = 0;
+int calculated_users = 0;
 bool block_all_clnt = false;
 
 int main(int argc, char *argv[])
@@ -270,6 +276,7 @@ int main(int argc, char *argv[])
 		user_p->running_thread = 0;
 		pthread_cond_init(&user_p->cond, NULL);
 		pthread_cond_init(&user_p->cal_cond, NULL);
+		pthread_mutex_init(&user_p->mutex, NULL);
 
 		pthread_create(&user_p->thread_id, NULL, clnt_handler, (void*)&user_p);
 		pthread_detach(user_p->thread_id);
@@ -288,27 +295,12 @@ int main(int argc, char *argv[])
 
 void clnt_threads_handler_cleanup(void *arg)
 {
+	if (pthread_mutex_trylock(&m_mutex)) // unlock if parent thread is cancelled when mutex is locked
+		pthread_mutex_unlock(&m_mutex);
 	struct user* user_p = *((struct user**)arg);
 	pthread_mutex_lock(&m_mutex);
-	user_p->running_thread--; // should be 0 at this point
-	pthread_cond_signal(&user_p->cond);
+	user_p->running_thread--;
 	pthread_mutex_unlock(&m_mutex);
-	for (;;)
-	{
-		pthread_mutex_lock(&m_mutex);
-		if (user_p->running_thread == 0)
-		{
-			pthread_mutex_unlock(&m_mutex);
-			break;
-		}
-		else
-		{
-			printf(KRED" └ waiting id %d exit..."KWHT"\n", user_p->id);
-			pthread_cond_wait(&user_p->cond, &m_mutex);
-		}
-		pthread_mutex_unlock(&m_mutex);
-	}
-	printf(" └ user id %d successfully cleaned up\n", user_p->id);
 }
 
 void *clnt_map_comm_handler(void *arg)
@@ -320,42 +312,34 @@ void *clnt_map_comm_handler(void *arg)
 	printf(KMAG"[DEBUG|user_id:%d] Enter clnt_map_comm_handler()"KWHT"\n", user_p->id);
 	user_p->running_thread++;
 	pthread_mutex_unlock(&m_mutex);
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 
 	for (;;)
 	{
+		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 		pthread_mutex_lock(&m_mutex);
-		if (!user_p->online && user_p->running_thread != 3)
-		{
-			pthread_mutex_unlock(&m_mutex);
-			printf(" └ quitting clnt_map_comm_handler from user id :%d\n", user_p->id);
-			pthread_exit(0);
-			return NULL;
-		}
 #ifdef DEBUG
 		printf(KMAG"[DEBUG|user_id:%d] send map, clnt_map_comm_handler(), seq:%d\n"KWHT, user_p->id, seq);
 #endif
-		pthread_cond_wait(&send_map_cond, &m_mutex);
-		pthread_cond_signal(&user_p->cal_cond);
+		pthread_cond_wait(&until_next_tick, &m_mutex);
+		pthread_cond_signal(&user_p->cal_cond); // send signal to clnt_calc_handler, make it start calculate
 		if (user_p->online)
 		{
-			pthread_cond_wait(&user_p->cal_cond, &m_mutex);
+			pthread_cond_wait(&user_p->cal_cond, &m_mutex); // wait until calcuated
+			calculated_users++;
 			printf_clr(KYEL"  \\ calculated");
-			pthread_cond_wait(&map_ready_cond, &m_mutex);
+			pthread_cond_wait(&map_ready_cond, &m_mutex); // wait until calcuated
 			printf(KMAG"  \\ write at this point, user %d, status:%d, about seq: %d\n"KWHT, user_p->id, user_p->online, seq);
 			// do highlight this user snake
 			/* write(user_p->sock, buf, BUF_SIZE); */
 		}
-		else
-		{
-			pthread_mutex_unlock(&m_mutex);
-			printf(" └ quitting clnt_map_comm_handler from user id :%d\n", user_p->id);
-			pthread_exit(0);
-		}
 		pthread_mutex_unlock(&m_mutex);
+		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+		pthread_testcancel();
 	}
 
 	pthread_cleanup_pop(0);
-	return NULL;
 }
 
 void *clnt_calc_handler(void *arg)
@@ -367,35 +351,24 @@ void *clnt_calc_handler(void *arg)
 	if (active_users > 0)
 		pthread_cond_signal(&main_loop_cond);
 	pthread_mutex_unlock(&m_mutex);
+	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 
 	for (;;)
 	{
-		if (!user_p->online && user_p->running_thread != 3)
-		{
-			pthread_mutex_unlock(&m_mutex);
-			printf(" └ quitting clnt_calc_handler from user id :%d\n", user_p->id);
-			pthread_exit(0);
-			return NULL;
-		}
 		pthread_mutex_lock(&m_mutex);
-		pthread_cond_wait(&user_p->cal_cond, &m_mutex);
+		pthread_cond_wait(&user_p->cal_cond, &m_mutex); // wait signal from clnt_map_comm_handler()
 		if (user_p->online)
 		{
 			printf(KMAG" \\ calculate here, user_id %d, about seq: %d"KWHT"\n", user_p->id, seq);
-			pthread_cond_signal(&user_p->cal_cond);
-		}
-		else
-		{
-			pthread_mutex_unlock(&m_mutex);
-			printf(" └ quitting clnt_calc_handler from user id :%d\n", user_p->id);
-			pthread_exit(0);
-			return NULL;
+			/* cal() */
+			pthread_cond_signal(&user_p->cal_cond); // send signal that calculated
 		}
 		pthread_mutex_unlock(&m_mutex);
+		pthread_testcancel();
 	}
 
 	pthread_cleanup_pop(0);
-	return (void*)1;
 }
 
 void *clnt_handler(void *arg)
@@ -426,13 +399,12 @@ void *clnt_handler(void *arg)
 				printf(KGRN"[>] user started to play, id:%d."KWHT"\n", user_p->id);
 				pthread_create(&map_comm_id, NULL, clnt_map_comm_handler, (void*)&user_p);
 				pthread_create(&cal_map_id, NULL, clnt_calc_handler, (void*)&user_p);
-				pthread_detach(map_comm_id);
-				pthread_detach(cal_map_id);
 
 				struct coor_node* snake_head = (struct coor_node*)calloc(1, sizeof(struct coor_node));
 				pthread_mutex_lock(&m_mutex);
 
 				user_p->head = snake_head;
+				playing_users++;
 				find_empty_area(user_p);
 				create_snake(user_p, RIGHT);
 				pthread_mutex_unlock(&m_mutex);
@@ -442,7 +414,6 @@ void *clnt_handler(void *arg)
 		else
 		{
 			pthread_mutex_lock(&m_mutex);
-			pthread_cond_wait(&clnts_loop_cond, &m_mutex); // block this thread when calculating map
 			pthread_mutex_unlock(&m_mutex);
 			req = UNPACKING(buf);
 
@@ -457,27 +428,48 @@ void *clnt_handler(void *arg)
 
 
 	pthread_mutex_lock(&m_mutex);
-	pthread_kill(map_comm_id, 0);
-	user_p->online = false;
-	user_p->running_thread--;
-	active_users--;
+	playing_users--;
 	printf(KYEL"[-] client disconnected.(user id %d, ip %s)\n"KWHT, user_p->id, inet_ntoa(user_p->addr));
-	pthread_cond_signal(&user_p->cond);
+	user_p->online = false;
+	active_users--;
+	user_p->running_thread--;
+	pthread_mutex_unlock(&m_mutex);
+
+	pthread_cancel(map_comm_id);
+	pthread_cancel(cal_map_id);
+
+	pthread_join(map_comm_id, NULL);
+	pthread_join(cal_map_id, NULL);
+
+	pthread_mutex_lock(&m_mutex);
+	if (user_p->running_thread == 0)
+	{
+		printf(KGRN"[-] user id %d -> all threads are successfully quitted."KWHT"\n", user_p->id);
+		memset(user_p, 0, sizeof(struct user));
+	}
 	pthread_mutex_unlock(&m_mutex);
 
 	return NULL;
 }
 
-void *clnts_handler(void *arg)
+void *clnts_handler(void *arg) // garbage collector?
 {
+	int i;
 	for (;;)
 	{
-		pthread_mutex_lock(&m_mutex);
-		if (!block_all_clnt)
-		{
-			pthread_cond_broadcast(&clnts_loop_cond);
-		}
-		pthread_mutex_unlock(&m_mutex);
+		/* pthread_mutex_lock(&m_mutex); */
+		/* pthread_cond_wait(&clnt_quit_cond, &m_mutex); */
+		/* usleep(ONE_SEC * 2); // wait for exit */
+		/* for (i = 0; i < users_c; i++) */
+		/* { */
+			/* if (!users[i].online && users[i].running_thread) */
+			/* { */
+			/*     printf(KRED"[*] %d users thread does not quitted. running pthread_kill()..."KWHT"\n", users[i].id); */
+			/*     pthread_kill(users[i].clnt_calc_handler_id, 0); */
+			/*     pthread_kill(users[i].clnt_map_comm_handler_id, 0); */
+			/* } */
+		/* } */
+		/* pthread_mutex_unlock(&m_mutex); */
 	}
 }
 
@@ -496,37 +488,42 @@ void *world_handler(void *arg)
 
 	for (;;)
 	{
-		printf_clr(KYEL"[*] wait for all user calculated");
-		if (!active_users)
+		pthread_mutex_lock(&m_mutex);
+		if (!playing_users)
 		{
-			pthread_mutex_lock(&m_mutex);
+			/* pthread_cond_broadcast(&until_next_tick); // broadcast to all clnts, do write */
 			printf_clr(KBLU"[*] no user, stop server...");
 			printf_clr(KBLU"------------------------------");
+			calculated_users = 0;
 			pthread_cond_wait(&main_loop_cond, &m_mutex);
 			printf_clr(KBLU"[*] resume server...");
-			pthread_mutex_unlock(&m_mutex);
 		}
 		else
 		{
 			seq++;
-			pthread_cond_broadcast(&send_map_cond);
+			pthread_mutex_unlock(&m_mutex);
+			pthread_cond_broadcast(&until_next_tick); // resume all sub processes from clnts
+			printf_clr(KYEL"[*] wait for all user calculated");
 			for (;;)
 			{
 				pthread_mutex_lock(&m_mutex);
-				calced_user++;
-				if (calced_user == active_users)
+				if (calculated_users == playing_users || playing_users == 0)
 				{
-					calced_user = 0;
-					pthread_cond_broadcast(&map_ready_cond);
+					calculated_users = 0;
 					pthread_mutex_unlock(&m_mutex);
 					break;
 				}
+				pthread_mutex_unlock(&m_mutex);
 			}
-			printf("[-] map parsed, seq:%d, active user: %d\n", seq, active_users);
+			pthread_mutex_lock(&m_mutex);
+			printf("[-] all calculated. start parsing the map, about seq:%d, playing user: %d\n", seq, playing_users);
 			// map parse function here
+			pthread_cond_broadcast(&map_ready_cond); // broadcast to all clnts, do write
 		}
+		pthread_mutex_unlock(&m_mutex);
 
 		usleep(ONE_SEC);
+		printf_clr(KGRN"----- seq++ -----");
 	}
 
 	pthread_join(clnts_handler_id, NULL);
